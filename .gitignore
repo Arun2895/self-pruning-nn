@@ -1,0 +1,36 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+.env
+.venv/
+env/
+venv/
+bin/
+lib/
+develop-eggs/
+dist/
+downloads/
+eggs/
+.eggs/
+parts/
+sdist/
+var/
+wheels/
+*.egg-info/
+.installed.cfg
+*.egg
+
+# Data & Results
+data/
+gate_histograms.png
+
+# IDEs
+.vscode/
+.idea/
+.spyderproject
+.settings/
+
+# OS
+.DS_Store
+Thumbs.db
