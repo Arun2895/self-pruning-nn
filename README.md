@@ -4,8 +4,8 @@ This project implements a neural network that learns to prune its own weights du
 
 ## 📝 Case Study Submission
 For the **Tredence Analytics** case study, please refer to the following files:
-*   **[solution.py](file:///c:/Users/Arun%20J/self-pruning-neural-network/solution.py)**: The unified, single-script implementation (includes model, training, and plotting).
-*   **[REPORT.md](file:///c:/Users/Arun%20J/self-pruning-neural-network/REPORT.md)**: The formal analysis, results table, and sparsity explanation.
+*   **[solution.py](solution.py)**: The unified, high-performance implementation (Selection-Grade).
+*   **[REPORT.md](REPORT.md)**: The formal analysis, results table, and technical trade-offs.
 
 ## 🚀 Getting Started
 
@@ -16,13 +16,9 @@ pip install -r requirements.txt
 ```
 
 ### 2. Run Training
-You can run either the unified script or the modular version:
 ```bash
-# Unified Single Script (Recommended for submission)
+# Recommended Execution
 python solution.py
-
-# Modular Version
-python main.py
 ```
 
 ## 🧠 How it Works

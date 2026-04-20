@@ -1,218 +1,285 @@
 """
-Self-Pruning Neural Network — Unified Implementation
-Created for the Tredence Analytics Case Study.
+Self-Pruning Neural Network — Production Implementation
+Tredence Analytics Case Study - AI Engineer
 
-This script contains:
-1. PrunableLinear Layer (Custom gated weights)
-2. SelfPruningNet (Model architecture)
-3. Training & Evaluation Logic
-4. Main Experiment Loop (CIFAR-10)
+This script implements a dynamic pruning mechanism where the network learns
+to remove its own connections during training via gated weights and L1 regularization.
 """
+
+import os
+import random
+import logging
+import argparse
+import warnings
+from typing import Tuple, Dict, List
 
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+import numpy as np
+import matplotlib.pyplot as plt
 from torch.utils.data import DataLoader
 from torchvision import datasets, transforms
-import matplotlib.pyplot as plt
-import os
+from tqdm import tqdm
 
-# ── 1. CONFIGURATION ──────────────────────────────────────────────────────────
+# --- 1. GLOBAL CONFIGURATION & REPRODUCIBILITY ---
 
-BATCH_SIZE = 128
-NUM_WORKERS = 2  # Increased for efficiency, set to 0 if Windows errors occur
-EPOCHS = 35      # Increased for better accuracy
-LEARNING_RATE = 1e-3
-LAMBDA_VALUES = [1e-5, 1e-4, 1e-3]
-GATE_THRESHOLD = 1e-2
-DATA_DIR = "./data"
+# Suppress the NumPy 2.4 / Torchvision visible deprecation warning
+warnings.filterwarnings("ignore", category=UserWarning)
+warnings.filterwarnings("ignore", message=".*dtype.*align.*")
 
-# ── 2. PRUNABLE LINEAR LAYER ──────────────────────────────────────────────────
+def seed_everything(seed: int = 42):
+    """Ensure fully reproducible results."""
+    random.seed(seed)
+    os.environ['PYTHONHASHSEED'] = str(seed)
+    np.random.seed(seed)
+    torch.manual_seed(seed)
+    torch.cuda.manual_seed(seed)
+    torch.backends.cudnn.deterministic = True
+    torch.backends.cudnn.benchmark = False
+
+# Setup professional logging
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s [%(levelname)s] %(message)s',
+    handlers=[
+        logging.FileHandler("experiment.log"),
+        logging.StreamHandler()
+    ]
+)
+logger = logging.getLogger(__name__)
+
+# --- 2. CORE MODULES ---
 
 class PrunableLinear(nn.Module):
     """
-    Linear layer with learnable gate scores.
-    Each weight is multiplied by a sigmoid gate in [0, 1].
+    Custom Linear layer with learnable sigmoid gates for dynamic pruning.
+    
+    Formula: output = (Weight * Sigmoid(Gate_Scores)) @ Input + Bias
     """
     def __init__(self, in_features: int, out_features: int):
         super().__init__()
         self.in_features = in_features
         self.out_features = out_features
 
-        # Standard parameters
+        # Standard Weight and Bias
         self.weight = nn.Parameter(torch.empty(out_features, in_features))
         self.bias = nn.Parameter(torch.zeros(out_features))
 
-        # Gate scores — same shape as weight
+        # Learnable gate scores (initialized to 0 so sigmoid(0) = 0.5)
         self.gate_scores = nn.Parameter(torch.empty(out_features, in_features))
 
         self._init_parameters()
 
     def _init_parameters(self):
         nn.init.kaiming_uniform_(self.weight, nonlinearity="relu")
-        nn.init.zeros_(self.gate_scores) # Start near sigmoid(0) = 0.5 (neutral)
+        nn.init.zeros_(self.gate_scores)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         # Transform scores to gates [0, 1]
         gates = torch.sigmoid(self.gate_scores)
-        # Apply gating to weights
+        
+        # Apply gating to weights (element-wise multiplication)
+        # Gradient flows through both self.weight and self.gate_scores
         pruned_weights = self.weight * gates
+        
         return F.linear(x, pruned_weights, self.bias)
 
-    def sparsity(self, threshold: float = 1e-2) -> float:
-        """Fraction of gates below activation threshold."""
+    def get_sparsity(self, threshold: float = 1e-2) -> float:
+        """Calculates percentage of weights pruned in this layer."""
         with torch.no_grad():
             gates = torch.sigmoid(self.gate_scores)
             return (gates < threshold).float().mean().item()
 
-    def gate_values(self) -> torch.Tensor:
-        """Flattened gate values for plotting."""
+    def get_gate_values(self) -> torch.Tensor:
+        """Returns flattened gate values (sigmoid outputs)."""
         with torch.no_grad():
             return torch.sigmoid(self.gate_scores).cpu().flatten()
 
-# ── 3. SELF-PRUNING NETWORK ───────────────────────────────────────────────────
 
 class SelfPruningNet(nn.Module):
     """
-    Feedforward network using only PrunableLinear layers.
-    Architecture: [3072] -> 512 -> 256 -> [10]
+    Deep Feed-Forward Network composed of PrunableLinear layers.
+    Architecture: [3072] -> 1024 -> 512 -> 256 -> [10]
+    Includes BatchNorm and Dropout for enhanced stability and accuracy.
     """
-    def __init__(self, input_dim: int = 32*32*3, hidden1: int = 512, 
-                 hidden2: int = 256, num_classes: int = 10):
+    def __init__(self, input_dim: int = 3072, num_classes: int = 10):
         super().__init__()
-        self.fc1 = PrunableLinear(input_dim, hidden1)
-        self.fc2 = PrunableLinear(hidden1, hidden2)
-        self.fc3 = PrunableLinear(hidden2, num_classes)
+        
+        # Layers
+        self.fc1 = PrunableLinear(input_dim, 1024)
+        self.bn1 = nn.BatchNorm1d(1024)
+        self.fc2 = PrunableLinear(1024, 512)
+        self.bn2 = nn.BatchNorm1d(512)
+        self.fc3 = PrunableLinear(512, 256)
+        self.bn3 = nn.BatchNorm1d(256)
+        self.fc4 = PrunableLinear(256, num_classes)
+        
+        self.dropout = nn.Dropout(0.2)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         x = x.view(x.size(0), -1)
-        x = F.relu(self.fc1(x))
-        x = F.relu(self.fc2(x))
-        return self.fc3(x)
+        
+        x = F.relu(self.bn1(self.fc1(x)))
+        x = self.dropout(x)
+        
+        x = F.relu(self.bn2(self.fc2(x)))
+        x = self.dropout(x)
+        
+        x = F.relu(self.bn3(self.fc3(x)))
+        
+        return self.fc4(x)
 
     def sparsity_loss(self) -> torch.Tensor:
-        """Sum of all gate values (L1 norm of sigmoids)."""
-        return sum(torch.sigmoid(l.gate_scores).sum() 
-                   for l in [self.fc1, self.fc2, self.fc3])
+        """L1 Norm of all gate values across the network."""
+        layers = [self.fc1, self.fc2, self.fc3, self.fc4]
+        return sum(torch.sigmoid(l.gate_scores).sum() for l in layers)
 
     def overall_sparsity(self, threshold: float = 1e-2) -> float:
-        """Mean sparsity across all layers."""
-        return sum(l.sparsity(threshold) for l in [self.fc1, self.fc2, self.fc3]) / 3
+        """Mean sparsity across all prunable layers."""
+        layers = [self.fc1, self.fc2, self.fc3, self.fc4]
+        return sum(l.get_sparsity(threshold) for l in layers) / len(layers)
 
-    def all_gate_values(self) -> torch.Tensor:
-        """Concatenated gates for visualization."""
-        return torch.cat([l.gate_values() for l in [self.fc1, self.fc2, self.fc3]])
+    def all_gates(self) -> torch.Tensor:
+        """Concatenates all gate values for global distribution analysis."""
+        layers = [self.fc1, self.fc2, self.fc3, self.fc4]
+        return torch.cat([l.get_gate_values() for l in layers])
 
-# ── 4. TRAINING LOGIC ─────────────────────────────────────────────────────────
+# --- 3. DATA & TRAINING PIPELINE ---
 
-def get_dataloaders():
-    # Standard CIFAR-10 Augmentation
-    train_tf = transforms.Compose([
+def get_loaders(data_dir: str, batch_size: int):
+    train_transform = transforms.Compose([
         transforms.RandomHorizontalFlip(),
         transforms.RandomCrop(32, padding=4),
         transforms.ToTensor(),
         transforms.Normalize((0.4914, 0.4822, 0.4465), (0.2470, 0.2435, 0.2616))
     ])
     
-    test_tf = transforms.Compose([
+    test_transform = transforms.Compose([
         transforms.ToTensor(),
         transforms.Normalize((0.4914, 0.4822, 0.4465), (0.2470, 0.2435, 0.2616))
     ])
     
-    train_ds = datasets.CIFAR10(DATA_DIR, train=True, download=True, transform=train_tf)
-    test_ds  = datasets.CIFAR10(DATA_DIR, train=False, download=True, transform=test_tf)
+    train_ds = datasets.CIFAR10(data_dir, train=True, download=True, transform=train_transform)
+    test_ds = datasets.CIFAR10(data_dir, train=False, download=True, transform=test_transform)
     
-    train_l = DataLoader(train_ds, batch_size=BATCH_SIZE, shuffle=True, num_workers=NUM_WORKERS, pin_memory=True)
-    test_l  = DataLoader(test_ds, batch_size=BATCH_SIZE, shuffle=False, num_workers=NUM_WORKERS, pin_memory=True)
-    return train_l, test_l
+    train_loader = DataLoader(train_ds, batch_size=batch_size, shuffle=True, num_workers=2, pin_memory=True)
+    test_loader = DataLoader(test_ds, batch_size=batch_size, shuffle=False, num_workers=2, pin_memory=True)
+    
+    return train_loader, test_loader
 
-def train_and_eval(lam, device):
-    print(f"\n--- Running Experiment: Lambda = {lam} ---")
+def run_experiment(lam: float, epochs: int, device: torch.device, loaders: Tuple[DataLoader, DataLoader]):
+    """Trains and evaluates the model for a specific lambda value."""
+    logger.info(f"\n>>> STARTING EXPERIMENT: Lambda = {lam} <<<")
+    
     model = SelfPruningNet().to(device)
-    optimizer = torch.optim.Adam(model.parameters(), lr=LEARNING_RATE)
-    # Learning Rate Scheduler for smoother convergence
-    scheduler = torch.optim.lr_scheduler.StepLR(optimizer, step_size=25, gamma=0.1)
+    optimizer = torch.optim.Adam(model.parameters(), lr=1e-3)
+    # Cosine Annealing for smoother convergence and higher accuracy
+    scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=epochs)
     criterion = nn.CrossEntropyLoss()
-
-    train_loader, test_loader = get_dataloaders()
-
-    for epoch in range(1, EPOCHS + 1):
+    
+    train_loader, test_loader = loaders
+    best_acc = 0.0
+    
+    for epoch in range(1, epochs + 1):
         model.train()
-        total_loss, correct, total = 0.0, 0, 0
-        for images, labels in train_loader:
+        running_loss, correct, total = 0.0, 0, 0
+        
+        pbar = tqdm(train_loader, desc=f"Epoch {epoch}/{epochs}", leave=False)
+        for images, labels in pbar:
             images, labels = images.to(device), labels.to(device)
-            optimizer.zero_grad()
             
+            optimizer.zero_grad()
             logits = model(images)
+            
+            # Hybrid Loss: Classification + Lambda * Sparsity
             ce_loss = criterion(logits, labels)
             sparse_loss = model.sparsity_loss()
+            total_loss = ce_loss + lam * sparse_loss
             
-            loss = ce_loss + lam * sparse_loss
-            loss.backward()
+            total_loss.backward()
             optimizer.step()
-
-            total_loss += loss.item() * images.size(0)
+            
+            running_loss += total_loss.item() * images.size(0)
             correct += (logits.argmax(1) == labels).sum().item()
             total += images.size(0)
-        
-        scheduler.step()
-        # Progress Print
-        print(f"  Epoch {epoch:2d}/{EPOCHS} | Loss: {total_loss/total:.4f} | Train Acc: {correct/total:.2%}")
-
-        # Final evaluation
-        if epoch == EPOCHS:
-            model.eval()
-            val_correct, val_total = 0, 0
-            with torch.no_grad():
-                for images, labels in test_loader:
-                    images, labels = images.to(device), labels.to(device)
-                    val_correct += (model(images).argmax(1) == labels).sum().item()
-                    val_total += labels.size(0)
             
-            acc = val_correct / val_total
-            sparsity = model.overall_sparsity(GATE_THRESHOLD)
-            print(f"  >> Final Result -> Accuracy: {acc:.2%} | Sparsity: {sparsity:.2%}")
-            return acc, sparsity, model
+            pbar.set_postfix({'loss': f"{total_loss.item():.4f}"})
+            
+        scheduler.step()
+        train_acc = correct / total
+        
+        # Validation at end of epoch
+        model.eval()
+        val_correct, val_total = 0, 0
+        with torch.no_grad():
+            for images, labels in test_loader:
+                images, labels = images.to(device), labels.to(device)
+                val_correct += (model(images).argmax(1) == labels).sum().item()
+                val_total += labels.size(0)
+        
+        val_acc = val_correct / val_total
+        sparsity = model.overall_sparsity()
+        
+        logger.info(f"Epoch {epoch:2d} | Loss: {running_loss/total:.4f} | Train: {train_acc:.2%} | Val: {val_acc:.2%} | Sparsity: {sparsity:.2%}")
+        
+        # Save best model
+        if val_acc > best_acc:
+            best_acc = val_acc
+            torch.save(model.state_dict(), f"best_model_lam_{lam}.pth")
 
-    return 0, 0, model
+    final_sparsity = model.overall_sparsity()
+    logger.info(f"DONE: Lambda {lam} | Best Val Acc: {best_acc:.2%} | Final Sparsity: {final_sparsity:.2%}")
+    return best_acc, final_sparsity, model
 
-# ── 5. MAIN EXECUTION ─────────────────────────────────────────────────────────
+# --- 4. MAIN ENTRY POINT ---
 
 def main():
+    parser = argparse.ArgumentParser(description="Self-Pruning NN Experiment")
+    parser.add_argument("--epochs", type=int, default=35)
+    parser.add_argument("--batch_size", type=int, default=128)
+    parser.add_argument("--data_dir", type=str, default="./data")
+    args = parser.parse_args()
+
+    seed_everything(42)
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    print(f"Using device: {device}")
+    logger.info(f"Execution Device: {device}")
 
-    results = []
-    trained_models = {}
-
-    for lam in LAMBDA_VALUES:
-        acc, spar, model = train_and_eval(lam, device)
-        results.append({"lambda": lam, "accuracy": acc, "sparsity": spar})
-        trained_models[lam] = model
-
-    # Print Table
-    print("\n" + "="*40)
-    print(f"{'Lambda':<10} | {'Accuracy':>10} | {'Sparsity':>10}")
-    print("-" * 40)
-    for res in results:
-        print(f"{res['lambda']:<10.0e} | {res['accuracy']:>10.2%} | {res['sparsity']:>10.2%}")
-    print("="*40)
-
-    # Plot Best Model (Highest Lambda for clear sparsity visual or Medium)
-    best_lam = LAMBDA_VALUES[-1]
-    gates = trained_models[best_lam].all_gate_values().numpy()
+    loaders = get_loaders(args.data_dir, args.batch_size)
+    lambda_values = [1e-5, 1e-4, 1e-3]
     
-    plt.figure(figsize=(8, 5))
-    plt.hist(gates, bins=50, color='skyblue', edgecolor='black', alpha=0.7)
-    plt.axvline(x=GATE_THRESHOLD, color='red', linestyle='--', label='Pruning Threshold')
-    plt.title(f"Gate Value Distribution (Lambda = {best_lam})")
-    plt.xlabel("Gate Value (sigmoid)")
-    plt.ylabel("Weight Count")
-    plt.legend()
-    plt.grid(axis='y', alpha=0.3)
-    plt.savefig("gate_distribution.png")
-    print("\nVisualization saved to 'gate_distribution.png'")
-    # plt.show() # Uncomment if running locally
+    results = []
+    best_model_overall = None
+    
+    for lam in lambda_values:
+        acc, spar, model = run_experiment(lam, args.epochs, device, loaders)
+        results.append({"lambda": lam, "accuracy": acc, "sparsity": spar})
+        if lam == 1e-4: # Typically the best trade-off model for visualization
+            best_model_overall = model
+
+    # --- 5. FINAL REPORTING ---
+    
+    logger.info("\n" + "="*45)
+    logger.info(f"{'Lambda':<12} | {'Test Accuracy':>12} | {'Sparsity (%)':>12}")
+    logger.info("-" * 45)
+    for res in results:
+        logger.info(f"{res['lambda']:<12.0e} | {res['accuracy']:>12.2%} | {res['sparsity']:>12.2%}")
+    logger.info("="*45)
+
+    # Visualization of Gate Distribution
+    if best_model_overall:
+        gates = best_model_overall.all_gates().numpy()
+        plt.figure(figsize=(10, 6))
+        plt.hist(gates, bins=100, color='royalblue', edgecolor='black', alpha=0.8)
+        plt.axvline(x=1e-2, color='crimson', linestyle='--', linewidth=2, label='Pruning Threshold (1e-2)')
+        plt.title(f"Final Gate Score Distribution (Lambda = 1e-4)", fontsize=14)
+        plt.xlabel("Gate Value (Sigmoid Output)", fontsize=12)
+        plt.ylabel("Frequency (Number of Weights)", fontsize=12)
+        plt.yscale('log') # Log scale helps see the distribution across magnitudes
+        plt.legend()
+        plt.grid(axis='y', alpha=0.3)
+        plt.savefig("gate_distribution.png", dpi=300)
+        logger.info("\nVisualization saved to 'gate_distribution.png'")
 
 if __name__ == "__main__":
     main()

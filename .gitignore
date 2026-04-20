@@ -23,7 +23,9 @@ wheels/
 
 # Data & Results
 data/
-gate_histograms.png
+*.png
+*.log
+*.pth
 
 # IDEs
 .vscode/
