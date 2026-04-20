@@ -33,8 +33,6 @@ The distribution of gate values for the best-performing model (or most sparse mo
 - **A massive spike at 0**: Representing pruned weights.
 - **A cluster near 1 (or spread out)**: Representing active weights that the network deemed necessary for classification.
 
-![Gate Distribution](gate_distribution.png)
-*Figure 1: Histogram of gate values. The red dashed line indicates the pruning threshold.*
 
 ---
 
